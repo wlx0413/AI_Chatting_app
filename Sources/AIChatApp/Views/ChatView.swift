@@ -1429,7 +1429,8 @@ private struct InputBarView: View {
 
     // MARK: - 附件添加（按钮选择与拖拽共用）
 
-    /// 拖入的文件统一入口：图片/PDF 分别进入待发送列表，其余忽略。
+    /// 拖入 / 粘贴的文件统一入口：图片/PDF 分别进入待发送列表，其余忽略
+    /// （文本类文件由输入框直接读入正文，不经过这里）。
     private func handleDropped(_ urls: [URL]) {
         for url in urls {
             let ext = url.pathExtension.lowercased()
@@ -1535,8 +1536,8 @@ private struct InputBarView: View {
 // MARK: - 粘贴图片 / 拖拽文件编辑器
 
 /// `NSTextView` 包装的输入编辑器：在保留 Enter 发送 / Shift+Enter 换行的
-/// 基础上，支持 Cmd+V 粘贴剪贴板图片（png/tiff/Finder 图片文件）为附件，
-/// 以及把文件直接拖进输入框（走同一套 handleDropped 逻辑）。
+/// 基础上，支持 Cmd+V 粘贴剪贴板图片与文件（图片/PDF → 附件，文本类文件
+/// → 读入正文），以及把文件直接拖进输入框（共用同一套附件逻辑）。
 private struct PasteImageEditor: NSViewRepresentable {
     @Binding var text: String
     let font: NSFont
@@ -1611,26 +1612,139 @@ private struct PasteImageEditor: NSViewRepresentable {
     }
 }
 
-/// `NSTextView` 子类：拦截粘贴（剪贴板图片 → 附件）、拖拽文件（图片/PDF →
-/// 附件）、Enter 发送 / Shift+Enter 换行。
+/// `NSTextView` 子类：拦截粘贴（剪贴板图片 → 图片附件；Finder 复制的
+/// 图片/PDF 文件 → 附件；txt/md/csv/json 等文本文件 → 读出内容插入输入框）、
+/// 拖拽文件（图片/PDF → 附件）、Enter 发送 / Shift+Enter 换行。
 private final class EditorTextView: NSTextView {
     var onPasteImage: ((Data, String) -> Void)?
     var onDroppedFiles: (([URL]) -> Void)?
     var onEnter: (() -> Void)?
 
-    // MARK: - Cmd+V 粘贴图片
+    // MARK: - Cmd+V 粘贴（图片 / 文件 / 文本）
 
     override func paste(_ sender: Any?) {
+        // 1) 剪贴板里是 Finder 复制的文件（一个或多个）。
+        //    - 图片 / PDF → 作为附件加入待发送列表（与拖拽同一条路径）
+        //    - 文本类文件（txt/md/csv/json/…）→ 读出内容插入输入框正文
+        //    - 其它文件 → 保持输入框不变（不插入无意义的文件路径文本）
+        let fileURLs = Self.clipboardFileURLs()
+        if !fileURLs.isEmpty {
+            var handled = false
+
+            let attachURLs = fileURLs.filter { Self.isAttachableFileURL($0) }
+            if !attachURLs.isEmpty {
+                onDroppedFiles?(attachURLs)
+                handled = true
+            }
+
+            let textURLs = fileURLs.filter { Self.isTextFileURL($0) }
+            let pairs: [(url: URL, content: String)] = textURLs.compactMap { url in
+                guard let content = Self.textFileContent(from: url) else { return nil }
+                return (url, content)
+            }
+            if !pairs.isEmpty {
+                let content: String
+                if pairs.count == 1 {
+                    content = pairs[0].content
+                } else {
+                    // 多个文本文件：每个带文件名标题区分，避免混成一团。
+                    content = pairs
+                        .map { "📄 \($0.url.lastPathComponent)\n\($0.content)" }
+                        .joined(separator: "\n\n")
+                }
+                let selected = selectedRange()
+                if selected.location != NSNotFound {
+                    // `insertText(_:replacementRange:)` 内部会走 shouldChangeText
+                    // 并登记撤销栈，这里不再手动二次询问。
+                    insertText(content, replacementRange: selected)
+                    let caret = selected.location + (content as NSString).length
+                    setSelectedRange(NSRange(location: caret, length: 0))
+                    handled = true
+                }
+            }
+
+            if handled { return }
+            // 剪贴板有文件但都不是可处理类型：直接返回，不粘贴路径文本。
+            return
+        }
+
+        // 2) 剪贴板图片数据 / NSImage 对象 → 图片附件（截图、网页复制图片等）。
         if let (data, mime) = Self.clipboardImage() {
             onPasteImage?(data, mime)
             return
         }
-        // 剪贴板没有图片时走默认粘贴（文本粘贴完全不受影响）。
+
+        // 3) 剪贴板没有图片也没有文件时走默认粘贴（文本粘贴完全不受影响）。
         super.paste(sender)
     }
 
-    /// 从通用剪贴板提取图片：优先 png/tiff 数据，其次任意 NSImage 对象（转 PNG），
-    /// 再其次是 Finder 复制的图片文件 URL（读文件内容）。返回 `(数据, MIME)`。
+    // MARK: - 剪贴板文件 / 图片读取
+
+    /// 读取剪贴板里的文件 URL 列表（Finder 中复制/剪切的文件）。
+    static func clipboardFileURLs() -> [URL] {
+        NSPasteboard.general.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+    }
+
+    /// 是否是可粘贴为附件的文件（与拖拽 / 上传按钮支持的扩展名一致）。
+    static func isAttachableFileURL(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "pdf"
+            || ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff"].contains(ext)
+    }
+
+    /// 支持“读内容进输入框”的文本类扩展名。
+    private static let textFileExtensions: Set<String> = [
+        "txt", "text", "md", "markdown", "csv", "tsv", "json",
+        "log", "yaml", "yml", "xml"
+    ]
+
+    static func isTextFileURL(_ url: URL) -> Bool {
+        textFileExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// 文本内容读取上限（先按字节取前 1MB，再按字符截断）。
+    private static let maxTextFileBytes = 1 << 20
+    /// 插入输入框的字符上限。
+    private static let maxTextFileChars = 50_000
+
+    /// 读取文本类文件内容：UTF-16（BOM）/ UTF-8 / Latin-1 逐级尝试，
+    /// 超长截断；不可解码或读取失败返回 nil。
+    static func textFileContent(from url: URL) -> String? {
+        var data: Data
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            data = handle.readData(ofLength: maxTextFileBytes)
+        } catch {
+            return nil
+        }
+        guard !data.isEmpty else { return nil }
+
+        var text: String?
+        // UTF-16 LE/BE BOM 优先（许多 Windows 导出的 txt/csv 是 UTF-16）。
+        if data.count >= 2 {
+            let first = data[data.startIndex]
+            let second = data[data.index(after: data.startIndex)]
+            if (first == 0xFF && second == 0xFE) || (first == 0xFE && second == 0xFF) {
+                text = String(data: data, encoding: .utf16)
+            }
+        }
+        if text == nil { text = String(data: data, encoding: .utf8) }
+        if text == nil { text = String(data: data, encoding: .isoLatin1) }
+        guard var result = text else { return nil }
+        if result.first == "\u{FEFF}" { result.removeFirst() } // 去掉 UTF-8 BOM
+        if result.count > maxTextFileChars {
+            result = String(result.prefix(maxTextFileChars)) + "\n\n…[内容过长，已截断]"
+        }
+        return result
+    }
+
+    /// 从通用剪贴板提取图片：优先 png/tiff 数据，其次任意 NSImage 对象（转 PNG）。
+    /// Finder 复制的文件（含图片文件）已由 `paste(_:)` 按文件处理，这里不重复。
+    /// 返回 `(数据, MIME)`。
     static func clipboardImage() -> (Data, String)? {
         let pb = NSPasteboard.general
         // 1) 直接有 PNG / TIFF 数据（macOS 截图一般这两种）。
@@ -1640,15 +1754,7 @@ private final class EditorTextView: NSTextView {
         if let data = pb.data(forType: .tiff) {
             return (data, "image/tiff")
         }
-        // 2) Finder 里复制的图片文件 URL → 读文件内容。
-        if let urlString = pb.string(forType: .fileURL),
-           let url = URL(string: urlString),
-           let uti = UTType(filenameExtension: url.pathExtension),
-           uti.conforms(to: .image),
-           let data = try? Data(contentsOf: url) {
-            return (data, uti.preferredMIMEType ?? "image/png")
-        }
-        // 3) 任意 NSImage 对象 → 转 PNG（覆盖其它剪贴板图片格式）。
+        // 2) 任意 NSImage 对象 → 转 PNG（覆盖其它剪贴板图片格式）。
         if let image = pb.readObjects(forClasses: [NSImage.self], options: nil)?.first as? NSImage,
            let tiff = image.tiffRepresentation,
            let rep = NSBitmapImageRep(data: tiff) {

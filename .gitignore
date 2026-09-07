@@ -1,5 +1,6 @@
 # SwiftPM 构建产物
 .build/
+.build-x86/
 .stage/
 
 # macOS
