@@ -40,7 +40,7 @@ else
   swift build -c release --arch "$ARCH"
 fi
 
-BIN="$(find .build -path "*${ARCH}*/release/AIChatApp" -type f | head -1)"
+BIN="$(find "${SWIFT_SCRATCH:-.build}" -path "*${ARCH}*/release/AIChatApp" -type f | head -1)"
 [ -n "$BIN" ] || { echo "ERROR: built binary not found" >&2; exit 1; }
 BIN_DIR="$(dirname "$BIN")"
 
