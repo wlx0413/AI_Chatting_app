@@ -1742,28 +1742,39 @@ private final class EditorTextView: NSTextView {
         return result
     }
 
-    /// 从通用剪贴板提取图片：优先 png/tiff 数据，其次任意 NSImage 对象（转 PNG）。
-    /// Finder 复制的文件（含图片文件）已由 `paste(_:)` 按文件处理，这里不重复。
+    /// 从通用剪贴板提取图片：优先 png 数据，TIFF（系统截图）或任意
+    /// NSImage 对象统一转成 PNG，保证视觉模型可用。Finder 复制的文件
+    /// （含图片文件）已由 `paste(_:)` 按文件处理，这里不重复。
     /// 返回 `(数据, MIME)`。
     static func clipboardImage() -> (Data, String)? {
         let pb = NSPasteboard.general
-        // 1) 直接有 PNG / TIFF 数据（macOS 截图一般这两种）。
+        // 1) 直接有 PNG 数据 → 原样。
         if let data = pb.data(forType: .png) {
             return (data, "image/png")
         }
+        // 2) 系统截图（Cmd+Shift+Ctrl+4）以 TIFF 进入剪贴板：先转 PNG。
+        //    OpenAI 等视觉接口不接受 image/tiff，原样发送会失败。
         if let data = pb.data(forType: .tiff) {
-            return (data, "image/tiff")
-        }
-        // 2) 任意 NSImage 对象 → 转 PNG（覆盖其它剪贴板图片格式）。
-        if let image = pb.readObjects(forClasses: [NSImage.self], options: nil)?.first as? NSImage,
-           let tiff = image.tiffRepresentation,
-           let rep = NSBitmapImageRep(data: tiff) {
-            if let png = rep.representation(using: .png, properties: [:]) {
+            if let png = Self.pngData(from: data) {
                 return (png, "image/png")
             }
-            return (tiff, "image/tiff")
+            return (data, "image/tiff") // 兜底：极少见的不可解码场景
+        }
+        // 3) 任意 NSImage 对象 → 转 PNG（覆盖其它剪贴板图片格式）。
+        if let image = pb.readObjects(forClasses: [NSImage.self], options: nil)?.first as? NSImage {
+            if let png = Self.pngData(from: image.tiffRepresentation ?? Data()) {
+                return (png, "image/png")
+            }
         }
         return nil
+    }
+
+    /// 把任意可解码的位图数据转成 PNG；不可解码返回 nil。
+    private static func pngData(from data: Data) -> Data? {
+        guard let image = NSImage(data: data),
+              let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .png, properties: [:])
     }
 
     // MARK: - Enter 发送 / Shift+Enter 换行

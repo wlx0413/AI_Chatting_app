@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 /// Errors thrown by `OpenAIService`.
 enum OpenAIServiceError: LocalizedError, Equatable {
@@ -589,6 +590,29 @@ actor OpenAIService {
         return "[📄 文档：\(document.filename)]\n\(body)"
     }
 
+    /// 视觉接口原生接受的内联图片 MIME 白名单（OpenAI 系只认这四种）。
+    private static let acceptedImageMIMETypes: Set<String> =
+        ["image/png", "image/jpeg", "image/webp", "image/gif"]
+
+    /// 把图片附件规范化为可直接放进 `image_url` 的 data URI：
+    /// - png/jpeg/webp/gif 原样返回；
+    /// - 其它格式（macOS 系统截图在剪贴板里是 TIFF；还有 BMP/HEIC 等）
+    ///   实时转码为 PNG；
+    /// - 极少数转码失败场景退回原始 data URI（尽力而为）。
+    private static func imageDataURI(for attachment: ImageAttachment) -> String {
+        if acceptedImageMIMETypes.contains(attachment.mimeType) {
+            return attachment.dataURI
+        }
+        guard let data = attachment.decodedData,
+              let image = NSImage(data: data),
+              let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            return attachment.dataURI
+        }
+        return "data:image/png;base64," + png.base64EncodedString()
+    }
+
     /// Builds the wire-format `messages` array.
     ///
     /// Model-switch safety: when the current model is NOT multimodal, any
@@ -625,7 +649,7 @@ actor OpenAIService {
                         parts.append(PayloadContentPart(
                             type: "image_url",
                             text: nil,
-                            image_url: PayloadImageURL(url: attachment.dataURI)
+                            image_url: PayloadImageURL(url: Self.imageDataURI(for: attachment))
                         ))
                     }
                     result.append(.message(PayloadMessage(role: message.role.rawValue, content: .parts(parts), reasoning_content: message.reasoningContent)))
@@ -699,7 +723,7 @@ actor OpenAIService {
                     parts.append(PayloadContentPart(
                         type: "image_url",
                         text: nil,
-                        image_url: PayloadImageURL(url: attachment.dataURI)
+                        image_url: PayloadImageURL(url: Self.imageDataURI(for: attachment))
                     ))
                 }
             } else {
