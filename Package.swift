@@ -8,10 +8,12 @@ let package = Package(
     ],
     dependencies: [
         // MarkdownUI: GFM markdown rendering (tables, headings, code, etc.)
-        .package(url: "https://github.com/gonzalezreal/swift-markdown-ui.git", from: "2.4.0"),
+        // Vendored locally (Vendor/) so the project builds fully offline on any
+        // architecture without flaky network fetches at build time.
+        .package(path: "Vendor/swift-markdown-ui"),
         // SwiftMath: native LaTeX typesetting (iosMath Swift port, bundled math
         // fonts) used to render `$...$` / `$$...$$` math returned by AI models.
-        .package(url: "https://github.com/mgriebling/SwiftMath.git", from: "1.7.3")
+        .package(path: "Vendor/SwiftMath")
     ],
     targets: [
         .executableTarget(

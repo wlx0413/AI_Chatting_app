@@ -9,3 +9,8 @@
 xcuserdata/
 DerivedData/
 *.xcuserstate
+
+# 本地打包产物
+dist/*.dmg
+dist/*.zip
+*.dmg
