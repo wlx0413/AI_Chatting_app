@@ -132,6 +132,11 @@ private struct ProfileListView: View {
 
                 Divider()
 
+                // PDF 文档发送：最多渲染页数（0 = 全部页）。
+                PDFSettingsSection()
+
+                Divider()
+
                 // Backup & Restore: export/import all user data as ZIP.
                 BackupRestoreView()
                     .environmentObject(configStore)
@@ -147,6 +152,42 @@ private struct ProfileListView: View {
                     .environmentObject(LocalizationManager.shared)
             }
         }
+    }
+}
+
+// MARK: - PDF settings section
+
+/// PDF 文档发送设置：视觉模型渲染 PNG 的页数上限（0 = 全部页）。
+///
+/// 该参数全局生效（`PDFProcessor.maxRenderPages`），作用于「转成 PNG 发送」
+/// 与「图片 + 文字都发送」两种模式；渲染结果缓存按 `(attachment, maxPages)`
+/// 区分，改参数不会复用旧缓存。
+private struct PDFSettingsSection: View {
+    @AppStorage(PDFProcessor.maxRenderPagesKey) private var maxPages = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(L("pdf.settings.title"), systemImage: "doc.richtext")
+                .font(.headline)
+
+            HStack(spacing: 8) {
+                Text(L("pdf.settings.maxPages"))
+                Stepper(value: $maxPages, in: 0...100, step: 1) {
+                    Text(maxPages == 0
+                         ? L("pdf.settings.all")
+                         : L("pdf.settings.count", maxPages))
+                        .font(.body.monospacedDigit())
+                        .frame(minWidth: 90, alignment: .leading)
+                }
+                .frame(maxWidth: 240)
+            }
+
+            Text(L("pdf.settings.hint"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -353,8 +394,17 @@ private struct ProfileEditView: View {
                     Toggle(L("streaming.on"), isOn: $draft.streamEnabled)
 
                     Toggle(L("timestamp.on"), isOn: $draft.includeTimestamp)
+                        .help(L("timestamp.warning"))
 
                     Toggle(L("agent.mode"), isOn: $draft.toolsEnabled)
+
+                    Toggle(L("latex.on"), isOn: $draft.latexEnabled)
+                        .disabled(!LaTeXService.isAvailable)
+                        .help(
+                            LaTeXService.isAvailable
+                                ? L("latex.help", LaTeXService.installedEngineList)
+                                : L("latex.not.installed")
+                        )
                 } header: {
                     Text(L("generation"))
                 } footer: {
@@ -396,7 +446,15 @@ private struct ProfileEditView: View {
                                 Text(L("no.models.yet")).tag("")
                             }
                             ForEach(draft.availableModels, id: \.self) { model in
-                                Text(MultimodalSupport.displayName(model)).tag(model)
+                                HStack(spacing: 4) {
+                                    Text(model)
+                                    if MultimodalSupport.isMultimodal(model) {
+                                        Image(systemName: "photo")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .tag(model)
                             }
                         }
                         .tint(appearanceStore.accentColor)

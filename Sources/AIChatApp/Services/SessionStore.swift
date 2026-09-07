@@ -73,6 +73,19 @@ final class SessionStore: ObservableObject {
         return session
     }
 
+    /// Creates a new personalization-collection session (dedicated collector prompt,
+    /// can be turned into a personalization block) and makes it active.
+    @discardableResult
+    func newPersonalizationCollectionSession() -> ChatSession {
+        let session = ChatSession(
+            title: "个性化块采集",
+            isPersonalizationCollection: true
+        )
+        sessions.insert(session, at: 0)
+        activeSessionID = session.id
+        return session
+    }
+
     /// Deletes a session (by id).
     func delete(_ session: ChatSession) {
         sessions.removeAll { $0.id == session.id }
@@ -108,6 +121,18 @@ final class SessionStore: ObservableObject {
         sessions[index].autoTitle()
     }
 
+    /// Applies AI-chosen session metadata (first-round `set_session_metadata`
+    /// tool): a short title and/or an emoji shown in the sidebar.
+    func updateSessionMetadata(emoji: String?, title: String?, in sessionID: UUID) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        if let emoji, !emoji.isEmpty {
+            sessions[index].emoji = emoji
+        }
+        if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            sessions[index].title = title
+        }
+    }
+
     /// Updates the content of the last assistant message in a session.
     ///
     /// Used by the streaming pipeline to accumulate deltas into the
@@ -130,6 +155,49 @@ final class SessionStore: ObservableObject {
             return
         }
         sessions[sessionIndex].messages[msgIndex].sources = sources
+    }
+
+    /// Records the model that produced the last assistant message (info popover).
+    func updateLastAssistantModel(_ model: String, in sessionID: UUID) {
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              let msgIndex = sessions[sessionIndex].messages.indices.last,
+              sessions[sessionIndex].messages[msgIndex].role == .assistant else {
+            return
+        }
+        sessions[sessionIndex].messages[msgIndex].model = model
+    }
+
+    /// Records the relay-reported token usage for the last assistant message.
+    func updateLastAssistantUsage(_ usage: MessageUsage, in sessionID: UUID) {
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              let msgIndex = sessions[sessionIndex].messages.indices.last,
+              sessions[sessionIndex].messages[msgIndex].role == .assistant else {
+            return
+        }
+        sessions[sessionIndex].messages[msgIndex].usage = usage
+    }
+
+    /// Records the tool-call flow executed while producing the last assistant
+    /// message (Agent mode / get_time), for the message-info popover.
+    func updateLastAssistantToolFlow(_ flow: [MessageToolCallRecord], in sessionID: UUID) {
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              let msgIndex = sessions[sessionIndex].messages.indices.last,
+              sessions[sessionIndex].messages[msgIndex].role == .assistant else {
+            return
+        }
+        sessions[sessionIndex].messages[msgIndex].toolFlow = flow
+    }
+
+    /// Records the DeepSeek `reasoning_content` ("thinking") of the last
+    /// assistant message so the next request can pass it back (required by
+    /// DeepSeek reasoning models for tool-call rounds).
+    func updateLastAssistantReasoning(_ reasoning: String, in sessionID: UUID) {
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              let msgIndex = sessions[sessionIndex].messages.indices.last,
+              sessions[sessionIndex].messages[msgIndex].role == .assistant else {
+            return
+        }
+        sessions[sessionIndex].messages[msgIndex].reasoningContent = reasoning
     }
 
     /// Deletes a single message (by id) from the given session.

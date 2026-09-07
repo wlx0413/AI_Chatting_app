@@ -42,13 +42,24 @@ enum OpenAIServiceError: LocalizedError, Equatable {
 // MARK: - Deterministic payload encoding
 //
 // CRITICAL CACHE NOTE:
-// `JSONSerialization.data(withJSONObject:)` on a `[String: Any]` dictionary
-// does NOT guarantee a stable key order between process runs. Cloud prompt
-// caches hash the exact request bytes; a reordered key makes every request
-// look "new" and the cache NEVER hits.
+// Cloud prompt caches (DeepSeek) hash the exact request bytes. Foundation's
+// JSONEncoder stores keyed-container fields in an internal hash table and —
+// WITHOUT `.sortedKeys` — iterates it in hash order, which is randomized per
+// process launch. So even Codable structs emit their fields in a DIFFERENT
+// order on every app restart; the whole request looks "new" and the prompt
+// cache NEVER hits again.
 //
-// Codable structs emit fields in declaration order — deterministic and
-// byte-stable across runs — so we use them for the chat request body.
+// Fix: `.sortedKeys` on the shared `chatPayloadEncoder` (plus explicitly
+// sorted tool-schema dictionaries in `PayloadJSON`) makes the request bytes
+// byte-identical across runs and across restarts.
+
+/// JSONEncoder for the chat request body. `.sortedKeys` is mandatory for
+/// byte-stable payloads across process launches (see note above).
+private let chatPayloadEncoder: JSONEncoder = {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return encoder
+}()
 
 /// Top-level `/v1/chat/completions` request body with stable field order.
 private struct ChatPayload: Encodable {
@@ -115,6 +126,32 @@ private struct PayloadToolCallMessage: Encodable {
     let content: String?
     let tool_calls: [ToolCall]
 
+    /// DeepSeek reasoning models REQUIRE passing back the previous round's
+    /// `reasoning_content` when following up on a tool call.
+    let reasoning_content: String?
+
+    init(content: String?, tool_calls: [ToolCall], reasoning_content: String? = nil) {
+        self.content = content
+        self.tool_calls = tool_calls
+        self.reasoning_content = reasoning_content
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case role, content, tool_calls, reasoning_content
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(role, forKey: .role)
+        try container.encode(content, forKey: .content)
+        try container.encode(tool_calls, forKey: .tool_calls)
+        // Only emit reasoning_content when present (keeps payloads byte-identical
+        // for non-reasoning models and avoids "reasoning_content": null).
+        if let reasoning_content {
+            try container.encode(reasoning_content, forKey: .reasoning_content)
+        }
+    }
+
     struct ToolCall: Encodable {
         let id: String
         let type = "function"
@@ -166,6 +203,12 @@ private struct PayloadToolFunction: Encodable {
 }
 
 /// Recursive JSON value that can be encoded into a tool schema.
+///
+/// Dictionaries are encoded with SORTED keys: Swift `Dictionary` iteration
+/// order is randomized per process (per-run hash seed), so without sorting the
+/// `tools[].function.parameters` bytes change every app launch — and since
+/// `tools` precedes `messages` in the payload, DeepSeek's byte-identical
+/// prompt-cache prefix NEVER matches after a restart (hit rate collapses).
 private enum PayloadJSON: Encodable {
     case object([String: PayloadJSON])
     case array([PayloadJSON])
@@ -191,15 +234,45 @@ private enum PayloadJSON: Encodable {
     }
 
     func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
         switch self {
-        case .object(let dict): try container.encode(dict)
-        case .array(let array): try container.encode(array)
-        case .string(let string): try container.encode(string)
-        case .number(let number): try container.encode(number)
-        case .bool(let bool): try container.encode(bool)
-        case .null: try container.encodeNil()
+        case .object(let dict):
+            // Deterministic key order for the tool schema (see type doc above).
+            var keyed = encoder.container(keyedBy: SortedCodingKey.self)
+            for (key, value) in dict.sorted(by: { $0.key < $1.key }) {
+                try keyed.encode(value, forKey: SortedCodingKey(stringValue: key))
+            }
+        case .array(let array):
+            var container = encoder.singleValueContainer()
+            try container.encode(array)
+        case .string(let string):
+            var container = encoder.singleValueContainer()
+            try container.encode(string)
+        case .number(let number):
+            var container = encoder.singleValueContainer()
+            try container.encode(number)
+        case .bool(let bool):
+            var container = encoder.singleValueContainer()
+            try container.encode(bool)
+        case .null:
+            var container = encoder.singleValueContainer()
+            try container.encodeNil()
         }
+    }
+}
+
+/// `CodingKey` backed by a string, used to emit sorted JSON object keys.
+private struct SortedCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+
+    init(stringValue: String) {
+        self.stringValue = stringValue
+        self.intValue = nil
+    }
+
+    init?(intValue: Int) {
+        self.stringValue = "\(intValue)"
+        self.intValue = intValue
     }
 }
 
@@ -207,6 +280,30 @@ private enum PayloadJSON: Encodable {
 private struct PayloadMessage: Encodable {
     let role: String
     let content: PayloadContent
+
+    /// DeepSeek reasoning models require passing back the previous
+    /// `reasoning_content` on assistant messages. Only emitted when non-nil so
+    /// non-reasoning relays/models see byte-identical payloads as before.
+    let reasoning_content: String?
+
+    init(role: String, content: PayloadContent, reasoning_content: String? = nil) {
+        self.role = role
+        self.content = content
+        self.reasoning_content = reasoning_content
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case role, content, reasoning_content
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(role, forKey: .role)
+        try container.encode(content, forKey: .content)
+        if let reasoning_content {
+            try container.encode(reasoning_content, forKey: .reasoning_content)
+        }
+    }
 }
 
 /// Message content: either a plain string or an array of content parts
@@ -263,6 +360,31 @@ private struct PayloadImageURL: Encodable {
 /// - `GET /v1/models` (returns model list **and** dynamic prices, if any)
 /// - `POST /v1/chat/completions` with **SSE streaming** exposed via
 ///   `AsyncThrowingStream<String, Error>`.
+/// Token usage reported by the relay on the final stream chunk (DeepSeek
+/// extends the standard `usage` with `prompt_cache_hit_tokens` /
+/// `prompt_cache_miss_tokens`). All fields are optional because different
+/// relays / models report different subsets.
+struct StreamUsage: Sendable, Equatable {
+    /// Total input tokens for this request (nil when the relay omits it).
+    var promptTokens: Int?
+
+    /// Total output tokens (nil when the relay omits it).
+    var completionTokens: Int?
+
+    /// Input tokens served from DeepSeek's disk prefix cache.
+    var cacheHitTokens: Int?
+
+    /// Input tokens that had to be processed (cache miss).
+    var cacheMissTokens: Int?
+
+    /// Cache hit ratio when the cache split is reported.
+    var cacheHitRatio: Double? {
+        guard let hit = cacheHitTokens, let miss = cacheMissTokens else { return nil }
+        let total = hit + miss
+        return total > 0 ? Double(hit) / Double(total) : nil
+    }
+}
+
 /// Events yielded by `streamChatWithTools` (function calling).
 enum ChatStreamEvent: Sendable {
     /// A text delta of the final answer.
@@ -276,12 +398,25 @@ enum ChatStreamEvent: Sendable {
 
     /// Source references collected from web tools (rendered below the answer).
     case sources([ChatSource])
+
+    /// Token usage from the relay's final chunk (cache hit/miss included).
+    case usage(StreamUsage)
+
+    /// A completed tool call, recorded for the message-info popover.
+    case toolRecord(MessageToolCallRecord)
+
+    /// Reasoning ("thinking") text for the final answer (DeepSeek).
+    case reasoning(String)
 }
 
 /// Accumulates fragmented streaming tool-call deltas for one index.
 private struct ToolRoundOutcome {
     var toolCalls: [Int: ToolCallAccumulator] = [:]
     var yieldedText = false
+
+    /// DeepSeek reasoning text accumulated during this round (must be passed
+    /// back on the follow-up tool round).
+    var reasoning = ""
 }
 
 private struct ToolCallAccumulator {
@@ -313,6 +448,9 @@ actor OpenAIService {
             struct Delta: Decodable {
                 let content: String?
 
+                /// DeepSeek reasoning models stream their "thinking" here.
+                let reasoning_content: String?
+
                 /// Streaming tool-call fragments (one per index).
                 struct ToolCallDelta: Decodable {
                     let index: Int?
@@ -333,9 +471,26 @@ actor OpenAIService {
 
         let choices: [Choice]?
 
+        /// Token usage reported on the final chunk. DeepSeek extends the
+        /// standard fields with `prompt_cache_hit_tokens` and
+        /// `prompt_cache_miss_tokens`.
+        struct Usage: Decodable {
+            let prompt_tokens: Int?
+            let completion_tokens: Int?
+            let prompt_cache_hit_tokens: Int?
+            let prompt_cache_miss_tokens: Int?
+        }
+
+        let usage: Usage?
+
         /// Extracts the delta text for this chunk, if any.
         var contentDelta: String? {
             choices?.first?.delta?.content
+        }
+
+        /// Extracts the reasoning ("thinking") delta, if any (DeepSeek).
+        var reasoningDelta: String? {
+            choices?.first?.delta?.reasoning_content
         }
 
         /// Extracts tool-call fragments for this chunk, if any.
@@ -376,16 +531,21 @@ actor OpenAIService {
     private actor PDFPrepCache {
         static let shared = PDFPrepCache()
 
-        /// attachment id → base64 PNG page images (vision models).
-        private var pages: [UUID: [String]] = [:]
+        /// "attachmentID:maxPages" → base64 PNG page images (vision models)。
+        /// key 带页数：改「最多渲染页数」设置后缓存不会复用旧页数结果。
+        private var pages: [String: [String]] = [:]
 
         /// attachment id → extracted text (text-only models).
         private var texts: [UUID: String] = [:]
 
-        func pages(for id: UUID) -> [String]? { pages[id] }
-        func setPages(_ value: [String], for id: UUID) {
+        static func pageKey(_ id: UUID, _ maxPages: Int) -> String {
+            "\(id.uuidString):\(maxPages)"
+        }
+
+        func pages(for id: UUID, maxPages: Int) -> [String]? { pages[Self.pageKey(id, maxPages)] }
+        func setPages(_ value: [String], for id: UUID, maxPages: Int) {
             if pages.count > 24 { pages.removeAll() }
-            pages[id] = value
+            pages[Self.pageKey(id, maxPages)] = value
         }
         func text(for id: UUID) -> String? { texts[id] }
         func setText(_ value: String, for id: UUID) {
@@ -395,15 +555,17 @@ actor OpenAIService {
     }
 
     /// Renders a PDF into base64 PNG pages (memoized), off the main thread.
+    /// 页数上限读用户可调参数 `PDFProcessor.maxRenderPages`（0 = 全部页）。
     private static func pdfPageImages(for document: DocumentAttachment) async -> [String] {
-        if let cached = await PDFPrepCache.shared.pages(for: document.id), !cached.isEmpty {
+        let limit = PDFProcessor.maxRenderPages
+        if let cached = await PDFPrepCache.shared.pages(for: document.id, maxPages: limit), !cached.isEmpty {
             return cached
         }
         guard let data = document.decodedData, !data.isEmpty else { return [] }
         let images = await Task.detached(priority: .userInitiated) {
-            PDFProcessor.renderPages(from: data).map { $0.base64EncodedString() }
+            PDFProcessor.renderPages(from: data, maxPages: limit).map { $0.base64EncodedString() }
         }.value
-        await PDFPrepCache.shared.setPages(images, for: document.id)
+        await PDFPrepCache.shared.setPages(images, for: document.id, maxPages: limit)
         return images
     }
 
@@ -466,15 +628,15 @@ actor OpenAIService {
                             image_url: PayloadImageURL(url: attachment.dataURI)
                         ))
                     }
-                    result.append(.message(PayloadMessage(role: message.role.rawValue, content: .parts(parts))))
+                    result.append(.message(PayloadMessage(role: message.role.rawValue, content: .parts(parts), reasoning_content: message.reasoningContent)))
                 } else if !message.attachments.isEmpty && !isVision {
                     let note = "[图片已附加但当前模型不支持视觉，已忽略]"
                     let content = message.content.isEmpty
                         ? note
                         : message.content + "\n\n" + note
-                    result.append(.message(PayloadMessage(role: message.role.rawValue, content: .text(content))))
+                    result.append(.message(PayloadMessage(role: message.role.rawValue, content: .text(content), reasoning_content: message.reasoningContent)))
                 } else {
-                    result.append(.message(PayloadMessage(role: message.role.rawValue, content: .text(message.content))))
+                    result.append(.message(PayloadMessage(role: message.role.rawValue, content: .text(message.content), reasoning_content: message.reasoningContent)))
                 }
                 continue
             }
@@ -486,10 +648,10 @@ actor OpenAIService {
             }
 
             if isVision {
+                // 视觉模型：按每个 PDF 的 sendMode 发送（图片 / 文字 / 都发）。
                 for document in message.documentAttachments {
-                    let pages = await pdfPageImages(for: document)
-                    if pages.isEmpty {
-                        // Render failed (scanned/encrypted PDF): fall back to text.
+                    switch document.sendMode {
+                    case .text:
                         let text = await pdfText(for: document)
                         if !text.isEmpty {
                             parts.append(PayloadContentPart(
@@ -498,13 +660,37 @@ actor OpenAIService {
                                 image_url: nil
                             ))
                         }
-                    } else {
-                        for base64 in pages {
-                            parts.append(PayloadContentPart(
-                                type: "image_url",
-                                text: nil,
-                                image_url: PayloadImageURL(url: "data:image/png;base64,\(base64)")
-                            ))
+                    case .images, .both:
+                        let pages = await pdfPageImages(for: document)
+                        if pages.isEmpty {
+                            // Render failed (scanned/encrypted PDF): best-effort
+                            // text fallback so the document still reaches the model.
+                            let text = await pdfText(for: document)
+                            if !text.isEmpty {
+                                parts.append(PayloadContentPart(
+                                    type: "text",
+                                    text: pdfTextPart(document, text),
+                                    image_url: nil
+                                ))
+                            }
+                        } else {
+                            for base64 in pages {
+                                parts.append(PayloadContentPart(
+                                    type: "image_url",
+                                    text: nil,
+                                    image_url: PayloadImageURL(url: "data:image/png;base64,\(base64)")
+                                ))
+                            }
+                            if document.sendMode == .both {
+                                let text = await pdfText(for: document)
+                                if !text.isEmpty {
+                                    parts.append(PayloadContentPart(
+                                        type: "text",
+                                        text: pdfTextPart(document, text),
+                                        image_url: nil
+                                    ))
+                                }
+                            }
                         }
                     }
                 }
@@ -517,6 +703,7 @@ actor OpenAIService {
                     ))
                 }
             } else {
+                // 文本模型：图片发不了，任何 sendMode 都退化为提取文字。
                 for document in message.documentAttachments {
                     let text = await pdfText(for: document)
                     if !text.isEmpty {
@@ -538,9 +725,9 @@ actor OpenAIService {
 
             if parts.isEmpty {
                 // Nothing usable (e.g. encrypted PDF): fall back to raw content.
-                result.append(.message(PayloadMessage(role: message.role.rawValue, content: .text(message.content))))
+                result.append(.message(PayloadMessage(role: message.role.rawValue, content: .text(message.content), reasoning_content: message.reasoningContent)))
             } else {
-                result.append(.message(PayloadMessage(role: message.role.rawValue, content: .parts(parts))))
+                result.append(.message(PayloadMessage(role: message.role.rawValue, content: .parts(parts), reasoning_content: message.reasoningContent)))
             }
         }
         return result
@@ -679,7 +866,9 @@ actor OpenAIService {
     func streamChatWithTools(
         config: APIServerConfig,
         model: String,
-        messages: [ChatMessage]
+        messages: [ChatMessage],
+        tools toolsOverride: [BuiltinTool]? = nil,
+        usageHandler: ((StreamUsage) -> Void)? = nil
     ) async throws -> AsyncThrowingStream<ChatStreamEvent, Error> {
         let baseURL = try normalizedBaseURL(from: config.baseURL)
         guard !config.apiKey.isEmpty else {
@@ -690,14 +879,16 @@ actor OpenAIService {
         }
 
         let url = baseURL.appendingPathComponent("chat/completions")
-        let tools: [PayloadTool] = ChatTools.all.map { tool in
+        // nil = full built-in set (agent mode); non-nil = custom subset
+        // (e.g. just `get_time` for non-agent chats that still want the time).
+        let tools: [PayloadTool] = (toolsOverride ?? ChatTools.all).map { tool in
             PayloadTool(function: PayloadToolFunction(
                 name: tool.name,
                 description: tool.description,
                 parameters: tool.parameters
             ))
         }
-        let maxRounds = 5
+        let maxRounds = 8
 
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -715,11 +906,17 @@ actor OpenAIService {
                             apiKey: config.apiKey,
                             history: history,
                             tools: tools,
-                            continuation: continuation
+                            continuation: continuation,
+                            usageHandler: usageHandler
                         )
 
                         // 本轮模型直接给出文本答案 → 完成。
                         if outcome.toolCalls.isEmpty {
+                            // DeepSeek reasoning models: hand the final answer's
+                            // thinking text to the caller so it can be persisted.
+                            if !outcome.reasoning.isEmpty {
+                                continuation.yield(.reasoning(outcome.reasoning))
+                            }
                             if !outcome.yieldedText {
                                 throw OpenAIServiceError.emptyStream
                             }
@@ -737,7 +934,10 @@ actor OpenAIService {
                                     id: acc.id.isEmpty ? "call_\(acc.name)" : acc.id,
                                     function: .init(name: acc.name, arguments: acc.arguments)
                                 )
-                            }
+                            },
+                            // DeepSeek reasoning models require passing the
+                            // previous round's thinking text back.
+                            reasoning_content: outcome.reasoning.isEmpty ? nil : outcome.reasoning
                         )
                         history.append(.toolCall(assistantMessage))
 
@@ -754,6 +954,11 @@ actor OpenAIService {
                                 result = "Error executing tool \(toolName): \(error.localizedDescription)"
                             }
                             continuation.yield(.toolFinished(toolName))
+                            continuation.yield(.toolRecord(MessageToolCallRecord(
+                                name: toolName,
+                                arguments: acc.arguments,
+                                resultPreview: String(result.prefix(140))
+                            )))
                             collectedSources.append(contentsOf: ChatTools.sources(for: acc.name, result: result))
                             history.append(.toolResult(PayloadToolResultMessage(
                                 tool_call_id: acc.id.isEmpty ? "call_\(toolName)" : acc.id,
@@ -762,22 +967,38 @@ actor OpenAIService {
                         }
                     }
 
-                    // 循环耗尽仍无文本答案（模型每轮都只返回 tool_calls）：
-                    // 追加一轮**不带 tools** 的收尾请求，强制模型基于已执行
-                    // 的工具结果整理出最终答案，避免"工具用完就静默结束"。
-                    if !gotFinalAnswer {
-                        let outcome = try await performToolRound(
-                            url: url,
-                            model: model,
-                            apiKey: config.apiKey,
-                            history: history,
-                            tools: nil,
-                            continuation: continuation
-                        )
-                        if !outcome.yieldedText {
-                            throw OpenAIServiceError.emptyStream
-                        }
-                    }
+        // 循环耗尽仍无文本答案（模型每轮都只返回 tool_calls）：
+        // 追加一轮**不带 tools** 的收尾请求，强制模型基于已执行
+        // 的工具结果整理出最终答案，避免"工具用完就静默结束"。
+        //
+        // 关键：必须显式告知模型工具预算已耗尽、禁止再调用工具，且
+        // 严禁把工具调用写成 XML 标记（<tool_calls>/<invoke>/<parameter>）
+        // 混进回复文本——否则 DeepSeek 会在"还想继续搜索但 tools 已被
+        // 摘除"时把训练中学到的 Claude 风格 XML 调用原样吐给用户。
+        if !gotFinalAnswer {
+            history.append(.message(PayloadMessage(
+                role: "system",
+                content: .text(
+                    "You have used all your tool calls for this request. "
+                    + "Compose your final answer NOW using the tool results already returned above. "
+                    + "Do NOT call any more tools. "
+                    + "Do NOT output any XML tool-call markup such as <tool_calls>, <invoke>, "
+                    + "or <parameter> tags in your reply — output only the final answer text."
+                )
+            )))
+            let outcome = try await performToolRound(
+                url: url,
+                model: model,
+                apiKey: config.apiKey,
+                history: history,
+                tools: nil,
+                continuation: continuation,
+                usageHandler: usageHandler
+            )
+            if !outcome.yieldedText {
+                throw OpenAIServiceError.emptyStream
+            }
+        }
 
                     // Deliver collected sources (web references) before finishing.
                     if !collectedSources.isEmpty {
@@ -820,7 +1041,8 @@ actor OpenAIService {
         apiKey: String,
         history: [PayloadItem],
         tools: [PayloadTool]?,
-        continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation,
+        usageHandler: ((StreamUsage) -> Void)?
     ) async throws -> ToolRoundOutcome {
         let payload = ChatPayload(
             model: model,
@@ -836,7 +1058,7 @@ actor OpenAIService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         do {
-            request.httpBody = try JSONEncoder().encode(payload)
+            request.httpBody = try chatPayloadEncoder.encode(payload)
         } catch {
             throw OpenAIServiceError.transport(
                 "Failed to encode request body: \(error.localizedDescription)"
@@ -875,9 +1097,22 @@ actor OpenAIService {
             guard let chunkData = data.data(using: .utf8) else { continue }
             do {
                 let chunk = try JSONDecoder().decode(StreamChunk.self, from: chunkData)
+                if let u = chunk.usage,
+                   let hit = u.prompt_cache_hit_tokens,
+                   let miss = u.prompt_cache_miss_tokens {
+                    usageHandler?(StreamUsage(
+                        promptTokens: u.prompt_tokens,
+                        completionTokens: u.completion_tokens,
+                        cacheHitTokens: hit,
+                        cacheMissTokens: miss
+                    ))
+                }
                 if let delta = chunk.contentDelta, !delta.isEmpty {
                     outcome.yieldedText = true
                     continuation.yield(.text(delta))
+                }
+                if let r = chunk.reasoningDelta, !r.isEmpty {
+                    outcome.reasoning += r
                 }
                 if let deltas = chunk.toolCallDeltas {
                     for delta in deltas {
@@ -919,7 +1154,9 @@ actor OpenAIService {
     func streamChat(
         config: APIServerConfig,
         model: String,
-        messages: [ChatMessage]
+        messages: [ChatMessage],
+        usageHandler: ((StreamUsage) -> Void)? = nil,
+        reasoningHandler: ((String) -> Void)? = nil
     ) async throws -> AsyncThrowingStream<String, Error> {
         let baseURL = try normalizedBaseURL(from: config.baseURL)
         guard !config.apiKey.isEmpty else {
@@ -947,7 +1184,7 @@ actor OpenAIService {
         )
 
         do {
-            request.httpBody = try JSONEncoder().encode(payload)
+            request.httpBody = try chatPayloadEncoder.encode(payload)
         } catch {
             throw OpenAIServiceError.transport(
                 "Failed to encode request body: \(error.localizedDescription)"
@@ -977,6 +1214,7 @@ actor OpenAIService {
                     }
 
                     var yieldedAnyContent = false
+                    var accumulatedReasoning = ""
 
                     for try await line in bytes.lines {
                         // Honour cancellation while streaming.
@@ -998,9 +1236,22 @@ actor OpenAIService {
                         guard let chunkData = payload.data(using: .utf8) else { continue }
                         do {
                             let chunk = try JSONDecoder().decode(StreamChunk.self, from: chunkData)
+                            if let u = chunk.usage,
+                               let hit = u.prompt_cache_hit_tokens,
+                               let miss = u.prompt_cache_miss_tokens {
+                                usageHandler?(StreamUsage(
+                                    promptTokens: u.prompt_tokens,
+                                    completionTokens: u.completion_tokens,
+                                    cacheHitTokens: hit,
+                                    cacheMissTokens: miss
+                                ))
+                            }
                             if let delta = chunk.contentDelta, !delta.isEmpty {
                                 yieldedAnyContent = true
                                 continuation.yield(delta)
+                            }
+                            if let r = chunk.reasoningDelta, !r.isEmpty {
+                                accumulatedReasoning += r
                             }
                         } catch {
                             // Skip malformed chunks (keep-alive / metadata).
@@ -1010,6 +1261,11 @@ actor OpenAIService {
 
                     if !yieldedAnyContent {
                         throw OpenAIServiceError.emptyStream
+                    }
+                    // Hand the reasoning text (DeepSeek) to the caller for
+                    // persistence / next-request pass-back.
+                    if !accumulatedReasoning.isEmpty {
+                        reasoningHandler?(accumulatedReasoning)
                     }
                     continuation.finish()
 
@@ -1074,7 +1330,7 @@ actor OpenAIService {
         )
 
         do {
-            request.httpBody = try JSONEncoder().encode(payload)
+            request.httpBody = try chatPayloadEncoder.encode(payload)
         } catch {
             throw OpenAIServiceError.transport("Failed to encode body: \(error.localizedDescription)")
         }

@@ -30,9 +30,13 @@ struct AIChatApp: App {
     // MARK: - Initializers
 
     init() {
+        // 注册用户导入的衬线字体（见 ImportedFontManager；未导入时无操作）。
+        ImportedFontManager.shared.activateInstalled()
+
         // 建立唯一的 store 层级，所有层共享同一实例。
         let configStore = ConfigStore()
         let sessionStore = SessionStore()
+        let personalizationStore = PersonalizationStore()
 
         _configStore = StateObject(wrappedValue: configStore)
         _sessionStore = StateObject(wrappedValue: sessionStore)
@@ -43,7 +47,8 @@ struct AIChatApp: App {
                 sessionStore: sessionStore,
                 configStore: configStore,
                 service: OpenAIService(),
-                userProfileStore: profileStore
+                userProfileStore: profileStore,
+                personalizationStore: personalizationStore
             )
         )
         _appSettingViewModel = StateObject(

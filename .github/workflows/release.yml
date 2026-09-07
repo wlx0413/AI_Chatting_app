@@ -7,6 +7,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# 创建 GitHub Release 需要 contents: write（默认 GITHUB_TOKEN 只读，会 403）
+permissions:
+  contents: write
+
 jobs:
   build-and-release:
     runs-on: macos-latest    # macOS 14+ 云端主机，内置完整 Xcode（支持双架构交叉编译）

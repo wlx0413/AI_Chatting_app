@@ -35,13 +35,37 @@
 
 | 功能 | 借鉴项目 | 说明 |
 |---|---|---|
-| 代码块语法高亮 | [`raspu/Highlightr`](https://github.com/raspu/Highlightr) | MarkdownUI 代码块默认无高亮，给 code block 包一层即可，纯 Swift 无 WebView |
+| 代码块语法高亮 | ~~[`raspu/Highlightr`](https://github.com/raspu/Highlightr)~~ | ✅ **已实现**：自研 `ThemeCodeSyntaxHighlighter`（正则 tokenizer，零依赖，16 种语言关键字表）+ 语言栏 + 复制按钮 |
+| 思考过程折叠 | — | ✅ **已实现**：DeepSeek `reasoning_content` 抓取并持久化（工具轮回传是 API 硬要求），气泡内「💭 思考过程」默认折叠 |
+| 导出会话为 PDF | ~~第三方 md→pdf 库~~ | ✅ **已实现**：`ImageRenderer` + `CGPDFContext` 把 `MarkdownText` 真实视图树画进 PDF，**复用高亮/公式/表格**且文字为矢量可搜索；零依赖。局限见下 |
 | Mermaid 流程图 | 复用 `MathSegmenter` 的 provider 管线思路 | ` ```mermaid ` 块走 WKWebView 快照，架构与数学渲染同构 |
+| LaTeX 编译为 PDF | — | ✅ **已实现（可选开关）**：Agent 模式新工具 `compile_latex`。双重门槛 = profile 开关 + 本机 TeX 工具链（探测 `/Library/TeX/texbin` 等，xelatex/pdflatex/lualatex），缺任一则工具不注册（模型看不到）且设置开关置灰。产物存 `~/Documents/AIChatApp/LaTeX/<name>-<时间戳>/`，工具结果里带 `ARTIFACT: file://` 行 → 聊天里渲染成可点击 PDF 卡片。安全边界：模型只能给文件名主干，写不出输出目录 |
 | 朗读回复（TTS） | 零依赖：系统 `AVSpeechSynthesizer` | 助手消息加 🔈 按钮，中文用 `zh-CN` voice |
 | 语音输入（STT） | [`WhisperKit`](https://github.com/argmaxinc/WhisperKit) | Apple Silicon 原生优化；可先用系统听写 API 过渡 |
-| API Key 安全 | [`kishikawakatsumi/KeychainAccess`](https://github.com/kishikawakatsumi/KeychainAccess) | 检查 `ConfigStore` 明文存储，Keychain 是安全底线 |
+| API Key 安全 | [`kishikawakatsumi/KeychainAccess`](https://github.com/kishikawakatsumi/KeychainAccess) | ⚠️ **仍是明文**：`~/Library/Preferences/com.aichat.app.plist` 里可直接读出 key，Keychain 是安全底线 |
+| 会话累计花费 | — | 每条消息已持久化真实 `usage`，可算「本会话花费 / 今日累计」，纯 UI 活 |
+
+### PDF 导出的已知局限（后续可优化）
+
+1. **跨页处理是"整幅切带"**：内容按页高切片，正好落在分页线上的一行文字会被从中间截断。彻底解决需要按消息块测高、做块级分页（约半天）。
+2. **代码块长行会被裁切**：屏幕上代码块是横向滚动的（`ScrollView(.horizontal)`），PDF 里没有滚动概念，超出页宽的长行看不到。可为导出路径单独提供"自动换行"版代码块样式。
 
 ---
+
+## ⚠️ 上下文缓存的硬约束（血泪教训，改 prompt 结构前必读）
+
+DeepSeek 硬盘缓存按 **"下一轮请求的前缀完整包含上一轮落盘单元"** 匹配，因此：
+
+- **任何每轮会变的消息都不能放在 `messages` 末尾**——上一轮的单元以它结尾，下一轮该位置换成了新内容 → 单元永远匹配不上，命中率跌到只剩 system prompt（实测 9%）
+- 曾踩的两个坑：① 时间戳消息挂在末尾；② profile（长期记忆）消息挂在末尾
+- 正确布局：`system prompt → profile → 完整历史`（动态内容放最前，实测命中率 99%）
+- 实时信息（如当前时间）**改用工具获取**：工具消息只活在当轮请求内、不落盘历史，对下一轮前缀零污染
+- 序列化 Swift 字典必须加 `.sortedKeys`——字典 key 顺序每次随机，否则同一份数据每轮字节都不同
+- **⚠️ 2026-08-31 新增（本次实测）：`JSONEncoder` 不设 `.sortedKeys` 时，连 Codable struct 的字段顺序都是随机哈希序**——Foundation 内部键值容器是哈希表，per-process 随机种子。所以**所有 chat payload 编码必须统一用 `.sortedKeys` 的共享 encoder**（`chatPayloadEncoder`）。之前"struct 声明序保证稳定"的假设是错的：同进程内看起来稳定，每次重启 App 整个请求（含 tools、messages 的每个字段）字节全变，缓存每轮全灭。另外 `tools[].function.parameters` 是 `[String: Any]`，`PayloadJSON` 里要显式按 key 排序编码，双保险。
+- 时序：本次就是"Agent 模式开着（每轮都带 tools）→ 重启 App → tools JSON key 乱序 → 缓存崩溃"，且 `includeTimestamp` 开关冗余（Agent 已含 get_time），已关。
+
+---
+
 
 ## 🥉 第三梯队：架构级（长期价值）
 

@@ -34,14 +34,18 @@ enum TokenUsage {
     /// - Returns: Estimated input and output token counts **for the next
     ///   request**, i.e. history + system prompt + user profile count as
     ///   input context (they are all re-sent on every call — which is exactly
-    ///   how OpenAI billing works).
+    ///   how OpenAI billing works). `freshInput` is the token count of the
+    ///   newest user message: the only input that CANNOT be served from the
+    ///   prompt cache on the next request. Everything else (system + profile +
+    ///   older history) is re-sent context that MAY hit the cache.
     static func summarize(
         _ messages: [ChatMessage],
         systemPrompt: String = "",
         profileJSON: String? = nil
-    ) -> (input: Int, output: Int) {
+    ) -> (input: Int, output: Int, freshInput: Int) {
         var input = 0
         var output = 0
+        var freshInput = 0
 
         // The system prompt + user profile are part of the prompt context.
         if !systemPrompt.isEmpty {
@@ -65,31 +69,43 @@ enum TokenUsage {
                 input += textTokens + imageTokens + documentTokens
             }
         }
-        return (input, output)
+
+        // The newest USER message is the only part of the next request that is
+        // guaranteed to miss the prefix cache.
+        if let last = messages.last(where: { $0.role == .user }) {
+            freshInput = estimateTokens(last.content)
+                + last.attachments.count * tokensPerImage
+                + last.documentAttachments
+                    .reduce(0) { $0 + $1.pageCount } * tokensPerImage
+        }
+        return (input, output, freshInput)
     }
 
     // MARK: - Cost estimation (USD per 1M tokens)
 
-    /// Price entries: known model-keywords → (input, output) per 1M tokens.
+    /// Price entries: known model-keywords → (input, output, cachedInput) per
+    /// 1M tokens. `cachedInput` (nil when unknown) is the per-token rate for
+    /// input served from the prompt cache — DeepSeek reports it explicitly,
+    /// and OpenAI/Anthropic-style relays map it from `prompt_cache_read`.
     /// Used as a **fallback** when the relay does not expose dynamic pricing.
-    private static let priceTable: [(keywords: [String], input: Double, output: Double)] = [
-        (["gpt-4o-mini"],       0.15, 0.60),
-        (["gpt-4o"],            2.50, 10.00),
-        (["gpt-4.1-mini"],      0.40, 1.60),
-        (["gpt-4.1"],           2.00, 8.00),
-        (["gpt-4-turbo"],       10.00, 30.00),
-        (["gpt-4"],             30.00, 60.00),
-        (["gpt-3.5"],           0.50, 1.50),
-        (["claude-3-7"],        3.00, 15.00),
-        (["claude-3-5-sonnet"], 3.00, 15.00),
-        (["claude-3-5-haiku"],  0.80, 4.00),
-        (["claude-3-opus"],     15.00, 75.00),
-        (["claude-3"],          3.00, 15.00),
-        (["gemini-2.5"],        1.25, 10.00),
-        (["gemini-2.0"],        0.10, 0.40),
-        (["gemini-1.5"],        1.25, 5.00),
-        (["deepseek-chat"],     0.27, 1.10),
-        (["deepseek-reasoner"], 0.55, 2.19),
+    private static let priceTable: [(keywords: [String], input: Double, output: Double, cachedInput: Double?)] = [
+        (["gpt-4o-mini"],       0.15, 0.60, nil),
+        (["gpt-4o"],            2.50, 10.00, nil),
+        (["gpt-4.1-mini"],      0.40, 1.60, nil),
+        (["gpt-4.1"],           2.00, 8.00, nil),
+        (["gpt-4-turbo"],       10.00, 30.00, nil),
+        (["gpt-4"],             30.00, 60.00, nil),
+        (["gpt-3.5"],           0.50, 1.50, nil),
+        (["claude-3-7"],        3.00, 15.00, nil),
+        (["claude-3-5-sonnet"], 3.00, 15.00, nil),
+        (["claude-3-5-haiku"],  0.80, 4.00, nil),
+        (["claude-3-opus"],     15.00, 75.00, nil),
+        (["claude-3"],          3.00, 15.00, nil),
+        (["gemini-2.5"],        1.25, 10.00, nil),
+        (["gemini-2.0"],        0.10, 0.40, nil),
+        (["gemini-1.5"],        1.25, 5.00, nil),
+        (["deepseek-chat"],     0.27, 1.10, 0.07),
+        (["deepseek-reasoner"], 0.55, 2.19, 0.14),
     ]
 
     /// Resolves effective prices for a model id.
@@ -105,11 +121,15 @@ enum TokenUsage {
     }
 
     /// Cost estimate: `full` assumes no prompt-cache hit; `cached` (when the
-    /// model/prices expose a cached-input rate) assumes the whole input
-    /// prefix is served from the cache.
+    /// model/prices expose a cached-input rate) assumes the WHOLE input prefix
+    /// is served from the cache; `blended` is the realistic middle ground —
+    /// the repeatedly re-sent context (system + profile + history) is billed
+    /// at the cached-input rate, and only the newest user message at the full
+    /// input rate.
     struct CostEstimate: Equatable {
         let full: Double
         let cached: Double?
+        let blended: Double?
     }
 
     /// Resolves effective prices for a model id.
@@ -135,7 +155,11 @@ enum TokenUsage {
 
         // 2) Relay-provided dynamic price (exact model id match).
         if let price = dynamicPrices[modelID], price.isValid {
-            return ModelPricing(input: price.prompt, output: price.completion, cachedInput: nil)
+            return ModelPricing(
+                input: price.prompt,
+                output: price.completion,
+                cachedInput: price.cachedInput
+            )
         }
 
         // 3) Built-in fallback.
@@ -143,7 +167,11 @@ enum TokenUsage {
         for entry in priceTable {
             let matched = entry.keywords.contains { lower.contains($0) }
             if matched {
-                return ModelPricing(input: entry.input, output: entry.output, cachedInput: nil)
+                return ModelPricing(
+                    input: entry.input,
+                    output: entry.output,
+                    cachedInput: entry.cachedInput
+                )
             }
         }
         return nil
@@ -163,10 +191,16 @@ enum TokenUsage {
 
     /// Computes estimated cost in USD for a model + token counts, preferring
     /// user-defined custom price, then relay dynamic prices.
+    ///
+    /// - Parameters:
+    ///   - freshTokens: Tokens of the newest user message (guaranteed cache
+    ///     miss). The rest of the input is the re-sent context that MAY hit
+    ///     the prompt cache. Pass 0 to ignore the cache-aware split.
     static func estimatedCost(
         model: String,
         inputTokens: Int,
         outputTokens: Int,
+        freshTokens: Int = 0,
         dynamicPrices: [String: ModelPrice] = [:],
         customPrice: CustomPrice? = nil
     ) -> CostEstimate? {
@@ -180,11 +214,20 @@ enum TokenUsage {
             + Double(outputTokens) / 1_000_000.0 * prices.output
 
         var cached: Double?
+        var blended: Double?
         if let cachedRate = prices.cachedInput, cachedRate >= 0 {
             cached = Double(inputTokens) / 1_000_000.0 * cachedRate
                 + Double(outputTokens) / 1_000_000.0 * prices.output
+
+            // Realistic split: re-sent history at cached rate, newest message
+            // at full input rate (it cannot have been cached yet).
+            let fresh = min(max(freshTokens, 0), inputTokens)
+            let history = inputTokens - fresh
+            blended = Double(history) / 1_000_000.0 * cachedRate
+                + Double(fresh) / 1_000_000.0 * prices.input
+                + Double(outputTokens) / 1_000_000.0 * prices.output
         }
-        return CostEstimate(full: full, cached: cached)
+        return CostEstimate(full: full, cached: cached, blended: blended)
     }
 
     // MARK: - Formatting

@@ -15,11 +15,18 @@ import AppKit
 /// (see `OpenAIService` which wraps them in `Task.detached`).
 enum PDFProcessor {
 
-    /// Maximum number of pages rendered for vision models (cost / context limit).
-    static let maxVisionPages = 5
-
     /// Longest edge (points) used when rasterizing a page for vision models.
     static let maxImageDimension: CGFloat = 1200
+
+    /// UserDefaults key for the configurable page-render limit.
+    static let maxRenderPagesKey = "pdf.maxRenderPages"
+
+    /// 用户可调参数：视觉模型最多渲染的 PDF 页数（0 = 全部页）。
+    /// 由设置界面写入，OpenAIService 渲染时读取。
+    static var maxRenderPages: Int {
+        let stored = UserDefaults.standard.integer(forKey: maxRenderPagesKey)
+        return max(stored, 0)
+    }
 
     // MARK: - Public API
 
@@ -34,11 +41,18 @@ enum PDFProcessor {
         return document.string ?? ""
     }
 
-    /// Renders up to `maxPages` pages to PNG `Data` (downscaled for vision
-    /// models). Returns an empty array for invalid PDFs.
-    static func renderPages(from data: Data, maxPages: Int = maxVisionPages) -> [Data] {
+    /// Renders pages of the PDF to PNG `Data` (downscaled for vision models).
+    ///
+    /// - Parameter maxPages: 上限页数；`nil` 或 `<= 0` = 渲染全部页。
+    /// - Returns: 每页一张 PNG；无效 PDF 返回空数组。
+    static func renderPages(from data: Data, maxPages: Int? = nil) -> [Data] {
         guard let document = PDFDocument(data: data) else { return [] }
-        let count = min(document.pageCount, maxPages)
+        let count: Int
+        if let maxPages, maxPages > 0 {
+            count = min(document.pageCount, maxPages)
+        } else {
+            count = document.pageCount
+        }
         var images: [Data] = []
         for index in 0..<count {
             guard let page = document.page(at: index),
@@ -50,47 +64,41 @@ enum PDFProcessor {
 
     // MARK: - Page rendering
 
+    /// Renders a page to PNG `Data`, downscaled so the longest edge stays
+    /// within `maxImageDimension`.
+    ///
+    /// Uses `PDFPage.thumbnail(of:for:)` instead of a manual `CGContext`
+    /// flip: PDFKit's renderer is rotation-aware and maps the media/crop box
+    /// correctly, so pages with `/Rotate` or a non-zero box origin no longer
+    /// have their edge text chopped ("腰斩").
     private static func render(_ page: PDFPage) -> Data? {
-        let bounds = page.bounds(for: .mediaBox)
-        let longest = max(bounds.width, bounds.height)
+        let media = page.bounds(for: .mediaBox)
+        let rotated = page.rotation == 90 || page.rotation == 270
+        let pageWidth = rotated ? media.height : media.width
+        let pageHeight = rotated ? media.width : media.height
+
+        let longest = max(pageWidth, pageHeight)
         let scale = min(1, maxImageDimension / longest)
-        let width = max(1, Int(bounds.width * scale))
-        let height = max(1, Int(bounds.height * scale))
+        let width = max(1, Int(pageWidth * scale))
+        let height = max(1, Int(pageHeight * scale))
 
-        guard let bitmap = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: width,
-            pixelsHigh: height,
-            bitsPerSample: 8,
-            samplesPerPixel: 4,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: .deviceRGB,
-            bytesPerRow: 0,
-            bitsPerPixel: 0
-        ) else { return nil }
-        bitmap.size = NSSize(width: CGFloat(width), height: CGFloat(height))
+        // 与页面旋转后纵横比一致的尺寸 → 无变形、无黑边。
+        let thumbnail = page.thumbnail(
+            of: NSSize(width: CGFloat(width), height: CGFloat(height)),
+            for: .mediaBox
+        )
+        let thumbSize = thumbnail.size
 
-        NSGraphicsContext.saveGraphicsState()
-        guard let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
-            NSGraphicsContext.restoreGraphicsState()
-            return nil
-        }
-        NSGraphicsContext.current = context
-
-        // White background (PDF pages are transparent by default).
+        // PDF 页面默认透明：铺白底后再输出 PNG。
+        let canvas = NSImage(size: thumbSize)
+        canvas.lockFocus()
         NSColor.white.setFill()
-        NSRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)).fill()
+        NSRect(origin: .zero, size: thumbSize).fill()
+        thumbnail.draw(in: NSRect(origin: .zero, size: thumbSize))
+        canvas.unlockFocus()
 
-        let cg = context.cgContext
-        cg.saveGState()
-        // PDFKit draws in bottom-up coordinates; flip to match the bitmap.
-        cg.translateBy(x: 0, y: CGFloat(height))
-        cg.scaleBy(x: 1, y: -1)
-        page.draw(with: .mediaBox, to: cg)
-        cg.restoreGState()
-
-        NSGraphicsContext.restoreGraphicsState()
-        return bitmap.representation(using: .png, properties: [:])
+        guard let tiff = canvas.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .png, properties: [:])
     }
 }

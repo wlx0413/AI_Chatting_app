@@ -41,18 +41,234 @@ struct BuiltinTool {
 /// Registry + execution for the built-in tools offered to the model.
 enum ChatTools {
 
-    /// The full tool set sent on every tool-enabled request.
+    /// 由 ChatViewModel 注入的处理函数：应用 AI 在第一轮对话为会话挑选的
+    /// emoji 和标题。工具在后台线程执行，通过 `MainActor.run` 跳回主线程调用。
+    @MainActor static var sessionMetadataSink: ((String, String) -> Void)?
+
+    /// 由 ChatViewModel 注入的个性化块解析器：按名字返回个性化块内容，未找到返回 nil。
+    /// 供 `fetch_personalization_block` 工具在主线程查询 PersonalizationStore。
+    @MainActor static var personalizationResolver: ((String) -> String?)?
+
+    /// 返回全部个性化块名字（用于“未找到时的可用列表”提示）。
+    @MainActor static var personalizationNames: (() -> [String])?
+
+    /// The base tool set sent on every agent-mode (tool-enabled) request.
     ///
-    /// Note: a `get_time` tool is deliberately NOT included — the app already
-    /// injects the current time as a `[yyyy-MM-dd HH:mm:ss]` prefix on the
-    /// newest user message when `includeTimestamp` is on, and the system
-    /// prompt tells the model to treat it as ground truth.
-    static let all: [BuiltinTool] = [calc, webSearch, webFetch, weather]
+    /// `set_session_metadata` / `fetch_personalization_block` 常驻注册表（保证
+    /// `execute` 能解析到它们），但是否**广告**给模型由
+    /// `set(latexEnabled:includeSessionMetadata:includeKnowledge:)` 控制。
+    static let all: [BuiltinTool] = [
+        getTime, calc, webSearch, webFetch, weather,
+        setSessionMetadata, fetchPersonalizationBlock,
+    ]
+
+    /// The full lookup registry: `all` plus the environment-gated
+    /// `compile_latex` when a TeX toolchain exists. Used by `execute` /
+    /// `sources` so a tool the model was ALLOWED to call (i.e. it was
+    /// registered in the request) is also resolvable locally — otherwise the
+    /// executor would reply "unknown tool" to a perfectly valid call.
+    static var allWithOptional: [BuiltinTool] {
+        var tools = all
+        if LaTeXService.isAvailable {
+            tools.append(compileLaTeX)
+        }
+        return tools
+    }
+
+    /// The tool set for one request.
+    ///
+    /// `compile_latex` is opt-in **and** environment-gated: the profile toggle
+    /// must be on AND a TeX engine must exist. When either is false the tool is
+    /// not registered at all, so the model never offers a capability the machine
+    /// cannot honour.
+    ///
+    /// `includeSessionMetadata` is `true` only for the FIRST exchange of a new
+    /// conversation: that's the only time the model is allowed to pick the
+    /// conversation's emoji + title. Later rounds omit the tool so the model
+    /// never rewrites the identity mid-conversation.
+    ///
+    /// `includeKnowledge` is `true` whenever at least one personalization block exists:
+    /// that's when `fetch_personalization_block` is useful.
+    static func set(
+        latexEnabled: Bool,
+        includeSessionMetadata: Bool = false,
+        includeKnowledge: Bool = false
+    ) -> [BuiltinTool] {
+        var tools = all.filter {
+            ($0.name != "set_session_metadata" || includeSessionMetadata)
+                && ($0.name != "fetch_personalization_block" || includeKnowledge)
+        }
+        if latexEnabled && LaTeXService.isAvailable {
+            tools.append(compileLaTeX)
+        }
+        return tools
+    }
+
+    // MARK: - set_session_metadata
+
+    /// First-round-only tool: lets the AI choose the conversation's emoji and
+    /// short title, which the sidebar then shows. Kept in the registry so a
+    /// (first-round) call always resolves; the sink applies the values to the
+    /// active session on the main actor.
+    static let setSessionMetadata = BuiltinTool(
+        name: "set_session_metadata",
+        description: """
+        Call this tool exactly ONCE, at the start of the very FIRST exchange of a brand-new \
+        conversation, to give the conversation an identity. Choose a concise title (no more than \
+        24 characters, in the user's language, summarizing what they asked about) and ONE emoji \
+        that best captures the topic. Never call it again in later turns.
+        """,
+        parameters: [
+            "type": "object",
+            "properties": [
+                "title": ["type": "string", "description": "短标题，≤24字，概括用户第一个问题的主题"],
+                "emoji": ["type": "string", "description": "最能代表本对话主题的单个 emoji（如 📚 🧠 💻 🎨 🍜 ⚖️ 🔬 🎬）"],
+            ],
+            "required": ["title", "emoji"],
+        ],
+        execute: { arguments in
+            let title = (arguments["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let emoji = (arguments["emoji"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !title.isEmpty else { return "Error: title must not be empty." }
+            await MainActor.run {
+                ChatTools.sessionMetadataSink?(emoji, title)
+            }
+            return "已为对话设置标题“\(title)”、emoji“\(emoji.isEmpty ? "（无）" : emoji)”。"
+        }
+    )
+
+    // MARK: - fetch_personalization_block
+
+    /// Reads a stored personalization block by exact name. Advertised whenever the user
+    /// has saved at least one block, so normal chats can pull the saved facts on
+    /// demand. Execution resolves through the injected `personalizationResolver`.
+    static let fetchPersonalizationBlock = BuiltinTool(
+        name: "fetch_personalization_block",
+        description: """
+        Retrieve the full stored content of a personalization block by its EXACT name. Knowledge blocks \
+        hold durable facts the user explicitly saved (e.g. account & personal info, team constants, \
+        a project spec, a checklist). Call this tool whenever the user refers to something that \
+        might live in a saved personalization block, or when a detail about the user/org isn't available \
+        in this conversation. Pass the exact block name — if it doesn't exist the tool lists the \
+        available names so you can retry. Never invent a block name or its content.
+        """,
+        parameters: [
+            "type": "object",
+            "properties": [
+                "name": ["type": "string", "description": "个性化块的名字（必须与创建时完全一致，区分大小写）"],
+            ],
+            "required": ["name"],
+        ],
+        execute: { arguments in
+            let name = (arguments["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !name.isEmpty else { return "Error: name must not be empty." }
+            let content = await MainActor.run { ChatTools.personalizationResolver?(name) }
+            if let content, !content.isEmpty {
+                return "个性化块「\(name)」内容如下：\n\n\(content)"
+            }
+            let names = await MainActor.run { ChatTools.personalizationNames?() } ?? []
+            return "没有找到个性化块「\(name)」。可用个性化块：\(names.isEmpty ? "（无）" : names.joined(separator: "、"))"
+        }
+    )
+
+    // MARK: - compile_latex
+
+    /// Writes a `.tex` document and compiles it to PDF with the local toolchain.
+    ///
+    /// Returns the produced paths (as a `file://` URL the UI turns into a
+    /// clickable card) or the condensed engine errors so the model can fix its
+    /// own source and retry.
+    static let compileLaTeX = BuiltinTool(
+        name: "compile_latex",
+        description: """
+        Write a LaTeX document to a file and compile it to PDF using the local \
+        TeX installation (available engines: \(LaTeXService.installedEngineList)). \
+        Pass the COMPLETE document including \\documentclass and \
+        \\begin{document}…\\end{document}. Prefer xelatex for Chinese text (use \
+        \\usepackage{ctex}). On failure you get the compiler errors — fix the \
+        source and call the tool again. Use this when the user asks for a PDF, \
+        a paper, a typeset document, or a printable file.
+        """,
+        parameters: [
+            "type": "object",
+            "properties": [
+                "source": [
+                    "type": "string",
+                    "description": "The complete LaTeX document source.",
+                ],
+                "filename": [
+                    "type": "string",
+                    "description": "Base filename without extension, e.g. \"report\". Letters, digits, - and _ only.",
+                ],
+                "engine": [
+                    "type": "string",
+                    "description": "Optional engine: xelatex (default, best for CJK), pdflatex or lualatex.",
+                ],
+            ],
+            "required": ["source"],
+        ],
+        extractSources: { result in LaTeXService.parseArtifacts(from: result) }
+    ) { arguments in
+        guard let source = arguments["source"] as? String,
+              !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "Error: missing \"source\" argument."
+        }
+        let stem = (arguments["filename"] as? String) ?? "document"
+        let engine = arguments["engine"] as? String
+
+        let result: LaTeXService.CompileResult
+        do {
+            result = try LaTeXService.compile(source: source, filenameStem: stem, engine: engine)
+        } catch {
+            return "Error: LaTeX compilation could not start — \(error.localizedDescription)"
+        }
+
+        if let pdf = result.pdfURL {
+            let pages = result.pageCount.map { " (\($0) pages)" } ?? ""
+            return """
+            Compiled successfully\(pages).
+            PDF: \(pdf.path)
+            Source: \(result.sourceURL.path)
+            ARTIFACT: \(pdf.absoluteString)
+            Tell the user the PDF is ready; the app shows a clickable link. Do NOT paste the whole source again.
+            """
+        }
+
+        return """
+        Compilation FAILED. The .tex was saved at \(result.sourceURL.path).
+        Compiler errors:
+        \(result.log)
+        Fix the source and call compile_latex again.
+        """
+    }
+
+    // MARK: - get_time
+
+    /// Returns the current date & time (server-local).
+    ///
+    /// The app no longer stamps requests with a timestamp (that broke DeepSeek's
+    /// byte-identical prefix cache: ~5% hits). A `get_time` call happens inside
+    /// the request — its `tool` result message is NOT persisted to history — so
+    /// the next request's `messages` prefix stays byte-identical and the cache
+    /// keeps hitting (~67%+). Available in ALL modes when `includeTimestamp` is on.
+    static let getTime = BuiltinTool(
+        name: "get_time",
+        description: "Returns the current date and time in \"yyyy-MM-dd HH:mm:ss\" (server-local). Call it whenever the user asks what time or date it is, or needs a precise \"now\". Never guess the time.",
+        parameters: [
+            "type": "object",
+            "properties": [:],
+        ]
+    ) { _ in
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter.string(from: Date())
+    }
 
     /// Executes a tool by name. Unknown tools / failures return a plain-text
     /// error string the model can read and adjust to.
     static func execute(name: String, argumentsJSON: String) async throws -> String {
-        guard let tool = all.first(where: { $0.name == name }) else {
+        guard let tool = allWithOptional.first(where: { $0.name == name }) else {
             return "Error: unknown tool \"\(name)\"."
         }
         var arguments: [String: Any] = [:]
@@ -66,7 +282,7 @@ enum ChatTools {
     /// Returns the source references (title + URL) a tool attached to its result,
     /// for the "Sources" card under the final assistant message.
     static func sources(for name: String, result: String) -> [ChatSource] {
-        guard let tool = all.first(where: { $0.name == name }) else { return [] }
+        guard let tool = allWithOptional.first(where: { $0.name == name }) else { return [] }
         return tool.extractSources(result)
     }
 

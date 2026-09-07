@@ -5,7 +5,9 @@ import Foundation
 /// Many OpenAI-compatible relays (one-api / new-api / OpenRouter format)
 /// include a `pricing` object on each model entry in `GET /v1/models`:
 ///   {"id":"gpt-4o-mini","pricing":{"prompt":0.15,"completion":0.6}}
-/// Units are USD per 1M tokens.
+/// OpenRouter-style relays additionally report `prompt_cache_read`, the
+/// per-token price for input served from the prompt cache (DeepSeek exposes
+/// the same cache-hit economics). Units are USD per 1M tokens.
 struct ModelPrice: Codable, Hashable {
     /// USD per 1M input (prompt) tokens.
     var prompt: Double
@@ -13,7 +15,17 @@ struct ModelPrice: Codable, Hashable {
     /// USD per 1M output (completion) tokens.
     var completion: Double
 
-    /// Whether both prices are non-negative (sane).
+    /// USD per 1M cached-input tokens (`prompt_cache_read`); nil when the
+    /// relay does not expose a cached rate.
+    var cachedInput: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case prompt
+        case completion
+        case cachedInput = "prompt_cache_read"
+    }
+
+    /// Whether the required prices are non-negative (sane).
     var isValid: Bool {
         prompt >= 0 && completion >= 0
     }
@@ -87,6 +99,11 @@ struct APIServerConfig: Identifiable, Codable, Hashable {
     /// model is aware of "now" (time of day / day of week / date).
     var includeTimestamp: Bool
 
+    /// Opt-in: expose the `compile_latex` tool (Agent mode) so the model can
+    /// write a .tex file and compile it to PDF with the LOCAL TeX install.
+    /// Also requires a detected toolchain — see `LaTeXService.isAvailable`.
+    var latexEnabled: Bool
+
     /// Whether replies stream token-by-token (true) or return as a single
     /// response (false). Toggleable per profile.
     ///
@@ -152,7 +169,8 @@ struct APIServerConfig: Identifiable, Codable, Hashable {
         modelPrices: [String: ModelPrice] = [:],
         systemPrompt: String = APIServerConfig.defaultSystemPrompt,
         streamEnabled: Bool = true,
-        includeTimestamp: Bool = true,
+        includeTimestamp: Bool = false,
+        latexEnabled: Bool = false,
         toolsEnabled: Bool = false,
         customPrice: CustomPrice? = nil
     ) {
@@ -166,6 +184,7 @@ struct APIServerConfig: Identifiable, Codable, Hashable {
         self.systemPrompt = systemPrompt
         self.streamEnabled = streamEnabled
         self.includeTimestamp = includeTimestamp
+        self.latexEnabled = latexEnabled
         self.toolsEnabled = toolsEnabled
         self.customPrice = customPrice
     }
@@ -193,7 +212,10 @@ struct APIServerConfig: Identifiable, Codable, Hashable {
         systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt)
             ?? APIServerConfig.defaultSystemPrompt
         streamEnabled = try container.decodeIfPresent(Bool.self, forKey: .streamEnabled) ?? true
-        includeTimestamp = try container.decodeIfPresent(Bool.self, forKey: .includeTimestamp) ?? true
+        // Cache-optimization: timestamps break DeepSeek's byte-identical prefix
+        // matching (hit rate collapses to ~5%), so they default OFF.
+        includeTimestamp = try container.decodeIfPresent(Bool.self, forKey: .includeTimestamp) ?? false
+        latexEnabled = try container.decodeIfPresent(Bool.self, forKey: .latexEnabled) ?? false
         toolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .toolsEnabled) ?? false
         customPrice = try container.decodeIfPresent(CustomPrice.self, forKey: .customPrice)
     }

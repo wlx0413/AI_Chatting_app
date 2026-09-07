@@ -49,11 +49,21 @@ enum FontPreset: String, CaseIterable, Identifiable {
     /// `Identifiable` conformance。
     var id: String { rawValue }
 
+    /// 用户导入的衬线字体族名（Settings → 外观 → 导入字体），无导入时为 nil。
+    ///
+    /// 内置衬线是系统 serif（拉丁 New York + 中文宋体 Songti SC 系统级联）；
+    /// 导入字体（如 Newsreader SC 合并字体）存在时优先使用，实现中英文同字体。
+    fileprivate static var importedSerifFamily: String? {
+        ImportedFontManager.shared.familyName
+    }
+
     /// 提供该预设下的主要字体（中文优先回退系统字体）。
     var uiFont: Font {
         switch self {
         case .serif:
-            // 衬线：优先经典衬线字体，中文回退系统衬线。
+            if let family = Self.importedSerifFamily {
+                return .custom(family, size: 14)
+            }
             return .system(.body, design: .serif)
         case .sans:
             return .system(.body, design: .default)
@@ -65,7 +75,11 @@ enum FontPreset: String, CaseIterable, Identifiable {
     /// 设置在 SwiftUI Text 上的字体（供 MessageBubble/Markdown 使用）。
     var textFont: Font {
         switch self {
-        case .serif:  return .system(.body, design: .serif)
+        case .serif:
+            if let family = Self.importedSerifFamily {
+                return .custom(family, size: 14)
+            }
+            return .system(.body, design: .serif)
         case .sans:   return .system(.body, design: .default)
         case .mono:   return .system(.body, design: .monospaced)
         }
@@ -73,12 +87,16 @@ enum FontPreset: String, CaseIterable, Identifiable {
 
     /// MarkdownUI 可用的字体族（按预设注入）。
     ///
-    /// serif 使用 `.system(.serif)` 而非 `.custom("ui-serif")`：custom 只映射
-    /// 拉丁字体（New York/Times），中文会回退到默认无衬线；system serif 设计
-    /// 会让系统自动为中文选择衬线字体（宋体 Songti SC），与用户消息一致。
+    /// serif 在用户导入字体（如 Newsreader SC）时用 `.custom(...)`，否则用
+    /// `.system(.serif)`——系统级联自动给出「拉丁 New York + 中文宋体 Songti
+    /// SC」。sans/mono 继续用系统设计。
     var fontPropertiesFamily: FontProperties.Family {
         switch self {
-        case .serif:  return .system(.serif)
+        case .serif:
+            if let family = Self.importedSerifFamily {
+                return .custom(family)
+            }
+            return .system(.serif)
         case .sans:   return .system(.default)
         case .mono:   return .system(.monospaced)
         }
@@ -87,10 +105,34 @@ enum FontPreset: String, CaseIterable, Identifiable {
     /// 返回指定字号的 SwiftUI Font（供 Label/Text/TextField 等任何视图使用）。
     func font(size: CGFloat) -> Font {
         switch self {
-        case .serif:  return .system(size: size, design: .serif)
+        case .serif:
+            if let family = Self.importedSerifFamily {
+                return .custom(family, size: size)
+            }
+            return .system(size: size, design: .serif)
         case .sans:   return .system(size: size, design: .default)
         case .mono:   return .system(size: size, design: .monospaced)
         }
+    }
+
+    /// 返回指定字号的 NSFont 等价物（供 NSTextView 等 AppKit 编辑器使用，
+    /// 视觉与 `font(size:)` 完全一致，含导入衬线字体）。
+    func nsFont(size: CGFloat) -> NSFont {
+        let system = NSFont.systemFont(ofSize: size)
+        let descriptor: NSFontDescriptor
+        switch self {
+        case .serif:
+            if let family = Self.importedSerifFamily,
+               let custom = NSFont(name: family, size: size) {
+                return custom
+            }
+            descriptor = system.fontDescriptor.withDesign(.serif) ?? system.fontDescriptor
+        case .sans:
+            descriptor = system.fontDescriptor.withDesign(.default) ?? system.fontDescriptor
+        case .mono:
+            descriptor = system.fontDescriptor.withDesign(.monospaced) ?? system.fontDescriptor
+        }
+        return NSFont(descriptor: descriptor, size: size) ?? system
     }
 }
 
@@ -175,10 +217,9 @@ final class AppearanceStore: ObservableObject {
 
     /// 当前字体预设。
     ///
-    /// > TODO: Markdown 渲染引擎（swift-markdown-ui）对中文 serif 映射不理想
-    /// > （custom 字体族只影响拉丁文字）。后续可尝试自定义 Theme 或替换渲染器。
-    /// > 目前 UI 暂不开放选择（`isFontPresetSelectionEnabled = false`），
-    /// > 默认使用 `.sans` 保证界面一致；相关代码全部保留，仅隐藏入口。
+    /// serif 采用 `.system(.serif)` 而非 `.custom(...)`：custom 只映射拉丁字体，
+    /// system serif 会让系统自动为中文选择宋体（Songti SC）。设置界面已开放
+    /// 选择（`isFontPresetSelectionEnabled = true`），切换后全局即时生效并持久化。
     @Published var fontPreset: FontPreset {
         didSet { persist() }
     }
@@ -297,8 +338,9 @@ final class AppearanceStore: ObservableObject {
 
     /// 是否在设置界面开放字体预设选择。
     ///
-    /// 当前为 `false`（隐藏入口，默认 sans）。实现 serif 中文映射后可改为 `true`。
-    var isFontPresetSelectionEnabled = false
+    /// 已开放：serif 采用 `.system(.serif)`（见 `fontPropertiesFamily`），系统会
+    /// 自动为中文选择宋体（Songti SC），Markdown 与全局 UI 即时生效并持久化。
+    var isFontPresetSelectionEnabled = true
 
     // MARK: - Persistence
 
@@ -317,7 +359,11 @@ extension Text {
     /// 应用当前字体预设 + 字号到 Text。
     func appearanceFont(_ preset: FontPreset, size: CGFloat) -> Text {
         switch preset {
-        case .serif:  return self.font(.system(size: size, design: .serif))
+        case .serif:
+            if let family = FontPreset.importedSerifFamily {
+                return self.font(.custom(family, size: size))
+            }
+            return self.font(.system(size: size, design: .serif))
         case .sans:   return self.font(.system(size: size, design: .default))
         case .mono:   return self.font(.system(size: size, design: .monospaced))
         }

@@ -97,17 +97,42 @@ final class UserProfileStore: ObservableObject {
     // MARK: - Encoding for the prompt
 
     /// JSON snapshot of all preferences (or nil when empty).
+    ///
+    /// `.sortedKeys` makes the serialization deterministic: Swift Dictionary
+    /// hash order is random per construction, so without it every request
+    /// would send a slightly different profile JSON and break DeepSeek's
+    /// byte-identical prefix cache.
     var jsonPayload: String? {
         guard !preferences.isEmpty else { return nil }
 
         let payload: [[String: String]] = preferences.map {
             ["category": $0.category, "value": $0.value]
         }
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]),
-              let str = String(data: data, encoding: .utf8) else {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys]
+        ),
+        let str = String(data: data, encoding: .utf8) else {
             return nil
         }
         return str
+    }
+
+    /// Deterministic fingerprint of the current profile payload (FNV-1a 64-bit).
+    ///
+    /// The profile message sits at index 1 of every request's byte-identical
+    /// cache prefix, so ANY change to it invalidates the cache for the whole
+    /// conversation history that follows. This fingerprint lets the UI detect
+    /// the change and explain the resulting hit-rate drop instead of leaving it
+    /// as a mysterious "why is my cache at 20%".
+    var payloadHash: String {
+        let json = jsonPayload ?? "nil"
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in json.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x00000100000001b3
+        }
+        return String(hash, radix: 16)
     }
 
     /// Parses a `<!-- PERSONALIZATION: {...} -->` block from an assistant reply.
